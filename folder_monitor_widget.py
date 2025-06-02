@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import sys
 
@@ -32,7 +33,7 @@ from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QReadWriteLock, pyqtSignal, QObject
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -48,13 +49,56 @@ FOLDER_LIST_FILE = STATE_DIR / "folders.json"
 LAST_CHECK_FILE = STATE_DIR / "last_check.json"
 WINDOW_STATE_FILE = STATE_DIR / "window_state.json"
 
-
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-def log(msg: str):
+def log(msg: str, folder: str = None, operation_type: str = None):
+    """Log a message while maintaining only the last snapshot and check per folder"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(LOG_FILE, "a") as f:
-        f.write(f"[{timestamp}] {msg}\n")
+    entry = f"[{timestamp}] {msg}\n"
+
+    # Read existing log if it exists
+    try:
+        with open(LOG_FILE, "r") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        lines = []
+
+    # Filter out old entries of the same type for this folder
+    new_lines = []
+    skip_next = False
+
+    for line in lines:
+        # Skip detail lines (those without timestamps)
+        if not line.startswith("["):
+            if skip_next:
+                continue
+            new_lines.append(line)
+            continue
+
+        # Check if this is an entry we might want to replace
+        if folder and folder in line:
+            if operation_type and any(op in line for op in ["Snapshot", "Changes", "No changes"]):
+                # This is an operation we want to potentially replace
+                current_op = "Snapshot" if "Snapshot" in line else "Check"
+                if current_op == operation_type:
+                    # Skip this line and its details (we'll add new one)
+                    skip_next = True
+                    continue
+
+        skip_next = False
+        new_lines.append(line)
+
+    # Add our new entry
+    new_lines.append(entry)
+
+    # Write back to file
+    with open(LOG_FILE, "w") as f:
+        f.writelines(new_lines)
+
+def clear_log():
+    """Clear the log file while keeping one empty line"""
+    with open(LOG_FILE, "w") as f:
+        f.write("")  # Write empty file
 
 def get_metadata(folder: Path):
     metadata = {}
@@ -80,6 +124,10 @@ def colored_icon(symbol: str, color: str) -> QIcon:
 
     return QIcon(pixmap)
 
+class FolderSignals(QObject):
+    operation_started = pyqtSignal(str)  # folder path
+    operation_finished = pyqtSignal(str)  # folder path
+
 class IntervalInputDialog(QDialog):
     def __init__(self, folder: str, parent=None):
         super().__init__(parent)
@@ -91,10 +139,10 @@ class IntervalInputDialog(QDialog):
         self.result = None
 
         layout = QVBoxLayout()
-        layout.addWidget(QLabel(f"Enter new interval for:\n{folder}\n(e.g. 5m, 2h, 1d) or (1d2h, 6h2m):"))
+        layout.addWidget(QLabel(f"Enter new interval for:\n{folder}"))
 
         self.input_line = QLineEdit()
-        self.input_line.setPlaceholderText("e.g. 10m, 5h, 30s")
+        self.input_line.setPlaceholderText("1h30m, 45m, 2d)")
         self.input_line.textChanged.connect(self.validate_input)
         layout.addWidget(self.input_line)
 
@@ -118,10 +166,8 @@ class IntervalInputDialog(QDialog):
         self.valid = re.fullmatch(pattern, text.strip().lower()) is not None
         self.ok_btn.setEnabled(self.valid)
 
-
     def get_interval(self):
         return self.input_line.text().strip().lower() if self.valid else None
-
 
 class FolderMonitorWidget(QWidget):
     def __init__(self, qt_platform):
@@ -135,13 +181,24 @@ class FolderMonitorWidget(QWidget):
         self.folder_intervals = self.load_json(FOLDER_LIST_FILE)
         self.last_check_times = self.load_json(LAST_CHECK_FILE)
         self.folder_statuses = {}
+        self.active_operations = set()  # Track folders with ongoing operations
+        self.signals = FolderSignals()
         self.executor = ThreadPoolExecutor()
+
+        #Thread safety
+        self.snapshots_lock = QReadWriteLock()
+        self.folder_intervals_lock = QReadWriteLock()
+        self.last_check_times_lock = QReadWriteLock()
 
         self.setup_ui(qt_platform)
         self.refresh_folder_list()
 
+        # Connect signals
+        self.signals.operation_started.connect(self.on_operation_started)
+        self.signals.operation_finished.connect(self.on_operation_finished)
+
         self.timer = QTimer(self)
-        # self.timer.timeout.connect(self.check_due_folders)
+        self.timer.timeout.connect(self.check_due_folders)  # This used to be commented for some reason ?!
         self.timer.start(60000)
 
     def setup_ui(self, qt_platform):
@@ -235,12 +292,10 @@ class FolderMonitorWidget(QWidget):
         else:
             self.resize(500, 400)  # default size
 
-
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder")
         if folder:
             self.folder_input.setText(folder)
-
 
     def parse_multiunit_interval(self, s: str) -> int:
         """Parses strings like '1h30m', '2d4h' into seconds."""
@@ -254,8 +309,6 @@ class FolderMonitorWidget(QWidget):
         text = self.time_input.text().strip().lower()
         is_valid = bool(re.fullmatch(r'(\d+[smhd])+', text))
         self.add_btn.setEnabled(is_valid)
-
-
 
     def show_context_menu(self, pos):
         item = self.folder_list.itemAt(pos)
@@ -316,7 +369,6 @@ class FolderMonitorWidget(QWidget):
         self.save_json(FOLDER_LIST_FILE, self.folder_intervals)
         self.refresh_folder_list()
 
-
     def refresh_folder_list(self):
         self.folder_list.clear()
         filter_text = self.filter_input.text().strip().lower()
@@ -348,15 +400,19 @@ class FolderMonitorWidget(QWidget):
                 continue
 
             status = self.folder_statuses.get(folder, "ok")
-            symbol = "✔" if status == "ok" else "❌"
-            color = "green" if status == "ok" else "red"
+
+            # Determine which icon to show
+            if folder in self.active_operations:
+                symbol = "↻"  # Loading spinner
+                color = "blue"
+            else:
+                symbol = "✔" if status == "ok" else "❌"
+                color = "green" if status == "ok" else "red"
 
             text = f"{folder}\n  Interval: {interval_str} | Last check: {last_checked_str}"
             item = QListWidgetItem(text)
             item.setIcon(colored_icon(symbol, color))
             self.folder_list.addItem(item)
-
-
 
     def update_folder_interval(self, folder):
         dialog = IntervalInputDialog(folder, self)
@@ -386,7 +442,6 @@ class FolderMonitorWidget(QWidget):
 
         return total_seconds
 
-
     def open_folder(self, folder):
         os.system(f'xdg-open "{folder}"')
 
@@ -400,6 +455,7 @@ class FolderMonitorWidget(QWidget):
         self.snapshots.pop(folder, None)
         self.last_check_times.pop(folder, None)
         self.folder_statuses.pop(folder, None)
+        self.active_operations.discard(folder)
 
         self.save_json(FOLDER_LIST_FILE, self.folder_intervals)
         self.save_json(SNAPSHOT_FILE, self.snapshots)
@@ -411,6 +467,7 @@ class FolderMonitorWidget(QWidget):
         now = time.time()
         self.last_check_times[folder] = now
         self.save_json(LAST_CHECK_FILE, self.last_check_times)
+        self.signals.operation_started.emit(folder)
         self.executor.submit(self.check_folder, folder)
         self.refresh_folder_list()
 
@@ -423,20 +480,52 @@ class FolderMonitorWidget(QWidget):
             with open(LOG_FILE, "r") as f:
                 lines = f.readlines()
 
-            filtered = [line for line in lines if folder in line]
+            # Find the most recent snapshot and check entries
+            snapshot_entry = None
+            check_entry = None
+            snapshot_details = []
+            check_details = []
 
-            if not filtered:
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                if folder in line:
+                    if "Snapshot" in line:
+                        snapshot_entry = line
+                        # Collect subsequent non-timestamped lines as details
+                        i += 1
+                        while i < len(lines) and not lines[i].startswith("["):
+                            snapshot_details.append(lines[i])
+                            i += 1
+                        continue
+                    elif "Changes" in line or "No changes" in line:
+                        check_entry = line
+                        # Collect subsequent non-timestamped lines as details
+                        i += 1
+                        while i < len(lines) and not lines[i].startswith("["):
+                            check_details.append(lines[i])
+                            i += 1
+                        continue
+                i += 1
+
+            if not snapshot_entry and not check_entry:
                 QMessageBox.information(self, "No Entries", f"No log entries found for:\n{folder}")
                 return
 
-            temp_path = STATE_DIR / "filtered_log.txt"
+            temp_path = STATE_DIR / f"logs_{Path(folder).name}.txt"
             with open(temp_path, "w") as out:
-                out.writelines(filtered)
+                if snapshot_entry:
+                    out.write(snapshot_entry)
+                    out.writelines(snapshot_details)
+                    out.write("\n")
+
+                if check_entry:
+                    out.write(check_entry)
+                    out.writelines(check_details)
 
             os.system(f'xdg-open "{temp_path}"')
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to read log file:\n{e}")
-
 
     def load_json(self, path):
         if path.exists():
@@ -455,20 +544,31 @@ class FolderMonitorWidget(QWidget):
             log(f"Error saving {path.name}: {e}")
 
     def take_snapshot(self, folder_path: Path):
+        self.signals.operation_started.emit(str(folder_path))
         self.executor.submit(self._snapshot_worker, folder_path)
 
     def _snapshot_worker(self, folder_path: Path):
-        metadata = get_metadata(folder_path)
-        self.snapshots[str(folder_path)] = metadata
-        self.save_json(SNAPSHOT_FILE, self.snapshots)
-        log(f"Snapshot updated for {folder_path}")
+        try:
+            metadata = get_metadata(folder_path)
+            try:
+                self.snapshots_lock.lockForWrite()
+                self.snapshots[str(folder_path)] = metadata
+                self.save_json(SNAPSHOT_FILE, self.snapshots)
+            finally:
+                self.snapshots_lock.unlock()
+            log(f"Snapshot updated for {folder_path}",
+                folder=str(folder_path),
+                operation_type="Snapshot")
+        finally:
+            self.signals.operation_finished.emit(str(folder_path))
 
     def run_check_all(self):
         now = time.time()
         for folder in self.folder_intervals:
             self.last_check_times[folder] = now
+            self.signals.operation_started.emit(folder)
             self.executor.submit(self.check_folder, folder)
-        self.save_json(LAST_CHECK_FILE, self.last_check_times)  # ✅ Save
+        self.save_json(LAST_CHECK_FILE, self.last_check_times)
         self.refresh_folder_list()
 
     def check_due_folders(self):
@@ -479,45 +579,67 @@ class FolderMonitorWidget(QWidget):
             if now - last_time > interval:
                 self.last_check_times[folder] = now
                 updated = True
+                self.signals.operation_started.emit(folder)
                 self.executor.submit(self.check_folder, folder)
         if updated:
             self.save_json(LAST_CHECK_FILE, self.last_check_times)
             self.refresh_folder_list()
 
     def check_folder(self, folder: str):
-        log("")  # blank line between runs
-        folder_path = Path(folder)
-        current = get_metadata(folder_path)
-        previous = self.snapshots.get(folder, {})
+        try:
+            folder_path = Path(folder)
+            current = get_metadata(folder_path)
+            previous = self.snapshots.get(folder, {})
 
-        changed_files = []
-        for path, (mtime, size) in current.items():
-            if path not in previous:
-                changed_files.append(f"NEW: {path}")
-            elif previous[path] != (mtime, size):
-                changed_files.append(f"MODIFIED: {path}")
+            changed_files = []
+            for path, (mtime, size) in current.items():
+                if path not in previous:
+                    changed_files.append(f"NEW: {path}")
+                elif previous[path] != (mtime, size):
+                    changed_files.append(f"MODIFIED: {path}")
 
-        deleted = set(previous.keys()) - set(current.keys())
-        for path in deleted:
-            changed_files.append(f"DELETED: {path}")
+            deleted = set(previous.keys()) - set(current.keys())
+            for path in deleted:
+                changed_files.append(f"DELETED: {path}")
 
-        if changed_files:
-            self.folder_statuses[folder] = "changed"
-            log(f"Changes in {folder}:")
-            for line in changed_files:
-                log(f"  {line}")
-        else:
-            self.folder_statuses[folder] = "ok"
-            log(f"No changes in {folder}")
+            if changed_files:
+                self.folder_statuses[folder] = "changed"
+                log(f"Changes in {folder}:", folder=folder, operation_type="Check")
+                for line in changed_files:
+                    # Add details without timestamps (they'll be associated with the parent entry)
+                    with open(LOG_FILE, "a") as f:
+                        f.write(f"  {line}\n")
+            else:
+                self.folder_statuses[folder] = "ok"
+                log(f"No changes in {folder}", folder=folder, operation_type="Check")
+        finally:
+            self.signals.operation_finished.emit(folder)
 
-        self.refresh_folder_list()
+    def get_current_status(self):
+        """Returns a string with current monitoring status"""
+        status = []
+        for folder in self.folder_intervals:
+            last_check = self.last_check_times.get(folder, 0)
+            last_check_str = datetime.fromtimestamp(last_check).strftime("%Y-%m-%d %H:%M:%S") if last_check else "Never"
+            status_str = self.folder_statuses.get(folder, "unknown")
+            status.append(f"{folder} - Last check: {last_check_str} - Status: {status_str}")
+        return "\n".join(status)
 
     def update_snapshots(self):
         for folder in self.folder_intervals:
+            self.signals.operation_started.emit(folder)
             self.take_snapshot(Path(folder))
 
     def open_log(self):
         os.system(f"xdg-open '{LOG_FILE}'")
+
+    def on_operation_started(self, folder):
+        self.active_operations.add(folder)
+        self.refresh_folder_list()
+
+    def on_operation_finished(self, folder):
+        self.active_operations.discard(folder)
+        self.refresh_folder_list()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
