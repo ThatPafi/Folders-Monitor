@@ -2,8 +2,8 @@
 import os
 import sys
 
+# Detect and configure the correct Qt Platform plugin. Returns the selected platform name. Defaults to X11 if no arguments passed.
 def setup_qt_platform() -> str:
-    """Detect and configure the correct Qt platform plugin. Returns the selected platform name."""
     force_wayland = "--wayland" in sys.argv
     force_xcb = "--xcb" in sys.argv
 
@@ -29,6 +29,7 @@ selected_platform = setup_qt_platform()
 import json
 import time
 import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -42,17 +43,20 @@ from PyQt5.QtWidgets import (
     QDialog,
 )
 
+# Constants
 STATE_DIR = Path.home() / ".local/state/folder_monitor"
 LOG_FILE = STATE_DIR / "log.txt"
 SNAPSHOT_FILE = STATE_DIR / "snapshots.json"
 FOLDER_LIST_FILE = STATE_DIR / "folders.json"
 LAST_CHECK_FILE = STATE_DIR / "last_check.json"
 WINDOW_STATE_FILE = STATE_DIR / "window_state.json"
+BACKUP_TARGETS_FILE = STATE_DIR / "backup_targets.json"
 
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
+
 def log(msg: str, folder: str = None, operation_type: str = None):
-    """Log a message while maintaining only the last snapshot and check per folder"""
+    # Log a message while maintaining only the last snapshot and check per folder
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     entry = f"[{timestamp}] {msg}\n"
 
@@ -96,7 +100,7 @@ def log(msg: str, folder: str = None, operation_type: str = None):
         f.writelines(new_lines)
 
 def clear_log():
-    """Clear the log file while keeping one empty line"""
+    # Clear the log file while keeping one empty line
     with open(LOG_FILE, "w") as f:
         f.write("")  # Write empty file
 
@@ -175,11 +179,12 @@ class FolderMonitorWidget(QWidget):
         self.setWindowTitle("Folder Monitor")
         self.load_window_state()
         #self.resize(500, 400)  # Optional: set initial size
-        #self.setMinimumWidth(150)
+        #self.setMinimumWidth(150)  # Optionnal : set minimum size
 
         self.snapshots = self.load_json(SNAPSHOT_FILE)
         self.folder_intervals = self.load_json(FOLDER_LIST_FILE)
         self.last_check_times = self.load_json(LAST_CHECK_FILE)
+        self.backup_targets = self.load_backup_targets()
         self.folder_statuses = {}
         self.active_operations = set()  # Track folders with ongoing operations
         self.signals = FolderSignals()
@@ -272,6 +277,24 @@ class FolderMonitorWidget(QWidget):
 
         self.setLayout(layout)
 
+    # Saved backup destinations logic
+    def load_backup_targets(self):
+        if BACKUP_TARGETS_FILE.exists():
+            try:
+                with open(BACKUP_TARGETS_FILE, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                log(f"Error loading backup_targets.json: {e}")
+        return []
+
+    def save_backup_targets(self, targets):
+        try:
+            with open(BACKUP_TARGETS_FILE, "w") as f:
+                json.dump(targets, f)
+        except Exception as e:
+            log(f"Error saving backup_targets.json: {e}")
+
+    # Persistent window size between launches
     def save_window_state(self):
         state = {
             "size": [self.size().width(), self.size().height()],
@@ -296,7 +319,9 @@ class FolderMonitorWidget(QWidget):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder")
         if folder:
             self.folder_input.setText(folder)
+        return folder
 
+    # Converts multi unit intervals to seconds
     def parse_multiunit_interval(self, s: str) -> int:
         """Parses strings like '1h30m', '2d4h' into seconds."""
         unit_multipliers = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}
@@ -310,7 +335,9 @@ class FolderMonitorWidget(QWidget):
         is_valid = bool(re.fullmatch(r'(\d+[smhd])+', text))
         self.add_btn.setEnabled(is_valid)
 
+    # Context menu logic
     def show_context_menu(self, pos):
+        self.backup_targets = self.load_backup_targets()  # ⬅️ Always refresh from disk
         item = self.folder_list.itemAt(pos)
         if not item:
             return
@@ -318,12 +345,26 @@ class FolderMonitorWidget(QWidget):
         folder_line = item.text().split('\n')[0].strip()
         menu = QMenu()
 
+        # Create main menu
         update_action = menu.addAction("Update Interval")
         remove_action = menu.addAction("Remove Folder")
         check_action = menu.addAction("Check Now")
         open_action = menu.addAction("Open Folder")
         view_logs_action = menu.addAction("View Logs for Folder")
 
+        # Create Backup submenu
+        backup_menu = menu.addMenu("Backup to")
+        backupMenu_browse = backup_menu.addAction("Browse ..")
+        backupMenuAdd = backup_menu.addAction("Add destination ..")
+        backupMenuManage = backup_menu.addAction("Manage destination ..")
+
+        # Creates submenu based on backup_targets.json
+        backup_actions = {}
+        for path in self.backup_targets:
+            action = backup_menu.addAction(path)
+            backup_actions[action] = path
+
+        # Main menu logic
         action = menu.exec_(self.folder_list.mapToGlobal(pos))
         if action == update_action:
             self.update_folder_interval(folder_line)
@@ -336,6 +377,46 @@ class FolderMonitorWidget(QWidget):
         elif action == view_logs_action:
             self.view_logs_for_folder(folder_line)
 
+        # Backup submenu logic
+        elif action == backupMenu_browse:
+            destination = self.browse_folder()
+            self.backup(folder_line, destination)
+
+        # Saves destinations for future use
+        if action == backupMenuAdd:
+            destination = self.browse_folder()
+            if destination and destination not in self.backup_targets:
+                self.backup_targets.append(destination)
+                self.save_backup_targets(self.backup_targets)
+            # Uncomment to run backup as well
+            #self.backup(folder_line, destination)
+        elif action in backup_actions:
+            self.backup(folder_line, backup_actions[action])
+
+        if action == backupMenuManage:
+            # For Linux
+            subprocess.run(['xdg-open', BACKUP_TARGETS_FILE])
+
+    # Calls personnal script: run_rsync_backup_manager
+    def backup(self, source, destination):
+        full_destination = destination + source
+        print(f"[INFO] source: {source} \n[INFO] Destination: {full_destination}")
+
+        print("[INFO] Calling rsync_backup_manager")
+        command = [
+            "konsole",
+            "--hold",
+            "-e",
+            "rsync_backup_manager.py", source, full_destination,
+            "--dry-run",
+        ]
+        try:
+            result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            print(f"[Success] Script return. \n{result.stdout}")
+        except subprocess.CalledProcessError as e:
+            print(f"[Error] Script failed: \n{e.stderr}")
+
+    # Main logic
     def interval_label(self, seconds: int) -> str:
         if seconds % 86400 == 0:
             return f"{seconds // 86400} days"
@@ -403,7 +484,7 @@ class FolderMonitorWidget(QWidget):
 
             # Determine which icon to show
             if folder in self.active_operations:
-                symbol = "↻"  # Loading spinner
+                symbol = "↻"  # Loading spinner (not animated)
                 color = "blue"
             else:
                 symbol = "✔" if status == "ok" else "❌"
@@ -471,6 +552,7 @@ class FolderMonitorWidget(QWidget):
         self.executor.submit(self.check_folder, folder)
         self.refresh_folder_list()
 
+    # View log with only specific folder information
     def view_logs_for_folder(self, folder):
         if not LOG_FILE.exists():
             QMessageBox.information(self, "No Log", "Log file does not exist.")
@@ -616,7 +698,7 @@ class FolderMonitorWidget(QWidget):
             self.signals.operation_finished.emit(folder)
 
     def get_current_status(self):
-        """Returns a string with current monitoring status"""
+        # Returns a string with current monitoring status
         status = []
         for folder in self.folder_intervals:
             last_check = self.last_check_times.get(folder, 0)
@@ -625,6 +707,7 @@ class FolderMonitorWidget(QWidget):
             status.append(f"{folder} - Last check: {last_check_str} - Status: {status_str}")
         return "\n".join(status)
 
+    # Issue with icon being incorrecly set after update snapshot
     def update_snapshots(self):
         for folder in self.folder_intervals:
             self.signals.operation_started.emit(folder)
