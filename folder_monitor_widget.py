@@ -397,7 +397,7 @@ class FolderMonitorWidget(QWidget):
             # For Linux
             subprocess.run(['xdg-open', BACKUP_TARGETS_FILE])
 
-    # Calls personnal script: run_rsync_backup_manager
+    # Calls personnal script: rsync_backup_manager
     def backup(self, source, destination):
         full_destination = destination + source
         print(f"[INFO] source: {source} \n[INFO] Destination: {full_destination}")
